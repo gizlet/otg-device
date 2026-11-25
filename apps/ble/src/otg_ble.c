@@ -87,7 +87,8 @@ static void enqueue(otg_ble_t* app, otg_ble_queue_t* queue,
  * dropped; every other packet waits for room while a host is attached, so the
  * controller's own buffers and link-layer flow control absorb a slow host
  * instead of the relay losing an ACL fragment or a credit-bearing event. A
- * flush for HCI_Reset during the wait discards the packet instead. */
+ * flush for HCI_Reset during the wait discards the packet instead, and so does
+ * OTG_BLE_HOST_STALL_MS without any slot freed. */
 static void enqueue_from_controller(otg_ble_t* app, otg_ble_queue_t* queue,
                                     otg_hci_type_t type, bool report,
                                     const uint8_t* data, size_t len) {
@@ -98,6 +99,7 @@ static void enqueue_from_controller(otg_ble_t* app, otg_ble_queue_t* queue,
     return;
   }
   bool waited = false;
+  uint32_t stalled_ms = 0u;
   lock(app);
   const uint32_t generation = app->flush_generation;
   while (!queue_push(queue, type, report, data, len)) {
@@ -115,10 +117,17 @@ static void enqueue_from_controller(otg_ble_t* app, otg_ble_queue_t* queue,
     }
     unlock(app);
     wake(app);
-    (void)h2_pal_semaphore_take(app->runtime->sync, app->space, SPACE_WAIT_MS);
+    h2_pal_result_t rc =
+        h2_pal_semaphore_take(app->runtime->sync, app->space, SPACE_WAIT_MS);
     lock(app);
     if (app->flush_generation != generation) {
       app->stats.flushed_on_reset++;
+      break;
+    }
+    /* Any freed slot is progress; only time with none counts as a stall. */
+    stalled_ms = rc == H2_PAL_OK ? 0u : stalled_ms + SPACE_WAIT_MS;
+    if (stalled_ms >= OTG_BLE_HOST_STALL_MS) {
+      app->stats.dropped_stalled++;
       break;
     }
   }

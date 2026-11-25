@@ -80,10 +80,11 @@ static h2_pal_result_t take_sem(void* user, h2_pal_semaphore_t* sem,
   CHECK(sem == kSpace);
   CHECK(g_lock_depth == 0); /* never waits with the queue lock held */
   g_space_waits++;
-  if (g_on_space_wait == NULL || g_space_waits > 100) {
-    fprintf(stderr, "relay waited for space with no pump to free it\n");
+  if (g_space_waits > 100) {
+    fprintf(stderr, "relay waited for space without bound\n");
     exit(EXIT_FAILURE);
   }
+  if (g_on_space_wait == NULL) return H2_PAL_ERR_TIMEOUT; /* stalled host */
   g_on_space_wait();
   return H2_PAL_OK;
 }
@@ -398,8 +399,42 @@ static void test_reset_recovers_blocked_host(void) {
   CHECK(host.sent == 1 && host.first[0] == 0x0e);
 }
 
+/* The host stops reading bulk IN while waiting for a command response: the
+ * ACL wait gives up after OTG_BLE_HOST_STALL_MS, so the event that follows
+ * still reaches the event endpoint. */
+static void test_stalled_acl_does_not_block_events(void) {
+  fake_port_t host = {.busy_after = 0};
+  const otg_hci_port_t host_port = {.user = &host, .send = fake_send};
+  fake_port_t controller = {.busy_after = -1};
+  const otg_hci_port_t controller_port = {.user = &controller,
+                                          .send = fake_send};
+  otg_ble_attach(&g_app, &controller_port, &host_port);
+  g_on_space_wait = NULL;
+  g_space_waits = 0;
+  const otg_hci_sink_t* from_controller = otg_ble_controller_sink(&g_app);
+  otg_ble_stats_t before = otg_ble_stats(&g_app);
+
+  for (unsigned i = 0; i <= OTG_BLE_TO_HOST_ACL_DEPTH; i++) {
+    deliver(from_controller, OTG_HCI_ACL, (uint8_t)i, 27u);
+  }
+  CHECK(g_space_waits == (int)(OTG_BLE_HOST_STALL_MS / 20u));
+  otg_ble_stats_t after = otg_ble_stats(&g_app);
+  CHECK(after.dropped_stalled - before.dropped_stalled == 1u);
+
+  const uint8_t complete[6] = {0x0e, 4, 1, 0x03, 0x0c, 0};
+  from_controller->receive(from_controller->user, OTG_HCI_EVENT, complete,
+                           sizeof(complete));
+  host.busy_after = 1; /* the event endpoint accepts one packet */
+  otg_ble_pump(&g_app);
+  CHECK(host.sent == 1 && host.first[0] == 0x0e);
+  host.busy_after = -1;
+  otg_ble_pump(&g_app);
+  CHECK(host.sent == 1 + (int)OTG_BLE_TO_HOST_ACL_DEPTH);
+}
+
 int main(void) {
   test_relay_and_order();
+  test_stalled_acl_does_not_block_events();
   test_reset_recovers_blocked_host();
   test_suspend_keeps_packets();
   test_drops();

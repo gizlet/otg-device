@@ -19,10 +19,13 @@
  * control (Command Complete, Command Status, Number Of Completed Packets) and
  * connection state, whose count the host's command and ACL credits bound.
  *
- * Other controller packets are never dropped while a host is attached: when
+ * Other controller packets are not dropped while a host keeps reading: when
  * their queue is full, the controller's receive callback waits until the host
  * side drains a slot. The controller keeps further packets in its own buffers
- * meanwhile, and link-layer flow control holds back the peer. Host-to-controller
+ * meanwhile, and link-layer flow control holds back the peer. The wait ends
+ * after OTG_BLE_HOST_STALL_MS without any slot being freed: the packet is
+ * dropped (dropped_stalled) so a host that stopped reading one endpoint
+ * cannot hold back events on the other forever. Host-to-controller
  * traffic needs no wait: the controller's command and ACL credits bound it,
  * and the pump keeps delivering it while a receive callback waits, so a host
  * can still recover a stalled link.
@@ -53,6 +56,8 @@ extern "C" {
 #define OTG_BLE_TO_HOST_EVENT_DEPTH 32u
 #define OTG_BLE_ADV_REPORT_MAX 16u
 #define OTG_BLE_TO_HOST_ACL_DEPTH 8u
+/** A full host queue with no progress for this long drops the packet. */
+#define OTG_BLE_HOST_STALL_MS 1000u
 
 typedef struct otg_ble_packet {
   otg_hci_type_t type;
@@ -77,6 +82,8 @@ typedef struct otg_ble_stats {
   uint32_t dropped_full;
   /** Controller packets that waited for room in a full host queue. */
   uint32_t backpressure_waits;
+  /** Controller packets dropped after OTG_BLE_HOST_STALL_MS without progress. */
+  uint32_t dropped_stalled;
   /** Advertising reports dropped at OTG_BLE_ADV_REPORT_MAX. */
   uint32_t dropped_reports;
   uint32_t dropped_rejected;

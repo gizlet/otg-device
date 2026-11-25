@@ -118,7 +118,36 @@ static void test_reconfigure_and_detach(void) {
   CHECK(g_sent == 2);
 }
 
+/* Detach while the relay fills the buffer: the fill is cancelled, the stale
+ * packet is never queued, and the next configuration does not send it. */
+static void test_detach_during_fill(void) {
+  otg_bth_in_t ep;
+  reset_fakes(&ep);
+  atomic_store(&ep.state, OTG_BTH_IN_FILLING);
+  g_mounted = false;
+  otg_bth_in_reset(&ep, false);
+  CHECK(atomic_load(&ep.state) == OTG_BTH_IN_FREE && g_writable == 1);
+
+  /* The relay's FILLING -> QUEUED step now fails and reports the drop. */
+  int expected = OTG_BTH_IN_FILLING;
+  CHECK(!atomic_compare_exchange_strong(&ep.state, &expected,
+                                        OTG_BTH_IN_QUEUED));
+  g_mounted = true;
+  otg_bth_in_reset(&ep, true); /* next host configures the device */
+  run_deferred();
+  CHECK(g_sent == 0 && atomic_load(&ep.state) == OTG_BTH_IN_FREE);
+
+  /* Reconfiguration also cancels a fill; the relay retries afterwards. */
+  atomic_store(&ep.state, OTG_BTH_IN_FILLING);
+  otg_bth_in_reset(&ep, true);
+  CHECK(atomic_load(&ep.state) == OTG_BTH_IN_FREE);
+  CHECK(otg_bth_in_start(&ep, kEvent, sizeof(kEvent)) == H2_PAL_OK);
+  run_deferred();
+  CHECK(g_sent == 1);
+}
+
 int main(void) {
+  test_detach_during_fill();
   test_suspend_between_accept_and_submit();
   test_busy_and_closed();
   test_reconfigure_and_detach();

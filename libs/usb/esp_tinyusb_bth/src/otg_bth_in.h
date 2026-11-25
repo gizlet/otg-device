@@ -54,7 +54,8 @@ h2_pal_result_t otg_bth_in_start(otg_bth_in_t* ep, const uint8_t* data,
 /* USB task only. */
 void otg_bth_in_submit(void* ep);
 void otg_bth_in_complete(otg_bth_in_t* ep);
-/** The configuration changed (configured) or went away (!configured). */
+/** The configuration changed (configured) or went away (!configured).
+ *  Cancels a fill in progress; the relay's start() then fails. */
 void otg_bth_in_reset(otg_bth_in_t* ep, bool configured);
 /** The bus resumed: submit a buffer queued while suspended. */
 void otg_bth_in_resume(otg_bth_in_t* ep);
