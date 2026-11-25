@@ -26,7 +26,9 @@ extern "C" {
  * ACL packets go to @p sink; writable() fires when an IN endpoint frees up
  * and after the host (re)configures the device. @p out_port sends events and
  * ACL data to the host; it returns CLOSED while the host has not configured
- * the device. Call once; boot-lifetime.
+ * the device, and WOULD_BLOCK while the bus is suspended or an endpoint is
+ * busy, so suspended packets stay queued until resume. Call once;
+ * boot-lifetime.
  */
 h2_pal_result_t otg_usb_bth_start(const otg_hci_sink_t* sink,
                                   const otg_hci_port_t** out_port);

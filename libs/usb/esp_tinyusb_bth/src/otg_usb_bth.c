@@ -141,15 +141,21 @@ static void on_usb_event(tinyusb_event_t* event, void* arg) {
 static h2_pal_result_t start_in(atomic_bool* busy, uint8_t* buffer,
                                 const uint8_t* data, size_t len,
                                 bool (*send)(void*, uint16_t)) {
+  /* Only an unconfigured device drops the packet. A suspended bus keeps the
+   * device mounted but refuses transfers; the packet stays queued and the
+   * relay retries it after resume. */
   if (!tud_mounted()) return H2_PAL_ERR_CLOSED;
+  if (!tud_ready()) return H2_PAL_ERR_WOULD_BLOCK;
   bool expected = false;
   if (!atomic_compare_exchange_strong(busy, &expected, true)) {
     return H2_PAL_ERR_WOULD_BLOCK;
   }
   memcpy(buffer, data, len);
   if (!send(buffer, (uint16_t)len)) {
+    /* Refused submissions are transient (suspend racing this call, or an
+     * endpoint still claimed): keep the packet for the next pump. */
     atomic_store(busy, false);
-    return H2_PAL_ERR_IO;
+    return H2_PAL_ERR_WOULD_BLOCK;
   }
   return H2_PAL_OK;
 }

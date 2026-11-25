@@ -320,8 +320,42 @@ static void test_acl_burst_waits_for_room(void) {
   CHECK(otg_ble_stats(&g_app).dropped_full == after.dropped_full + 1u);
 }
 
+/* A suspended bus refuses IN transfers with WOULD_BLOCK; credit-bearing
+ * events and ACL data stay queued and reach the host after resume. */
+static void test_suspend_keeps_packets(void) {
+  fake_port_t host = {.busy_after = -1};
+  const otg_hci_port_t host_port = {.user = &host, .send = fake_send};
+  fake_port_t controller = {.busy_after = -1};
+  const otg_hci_port_t controller_port = {.user = &controller,
+                                          .send = fake_send};
+  otg_ble_attach(&g_app, &controller_port, &host_port);
+  const otg_hci_sink_t* from_controller = otg_ble_controller_sink(&g_app);
+  otg_ble_stats_t before = otg_ble_stats(&g_app);
+
+  host.busy_after = 0; /* suspended */
+  const uint8_t complete[6] = {0x0e, 4, 1, 0x03, 0x0c, 0};
+  from_controller->receive(from_controller->user, OTG_HCI_EVENT, complete,
+                           sizeof(complete));
+  const uint8_t completed_packets[7] = {0x13, 5, 1, 0x40, 0, 1, 0};
+  from_controller->receive(from_controller->user, OTG_HCI_EVENT,
+                           completed_packets, sizeof(completed_packets));
+  deliver(from_controller, OTG_HCI_ACL, 0xc1, 27u);
+  for (int i = 0; i < 5; i++) otg_ble_pump(&g_app); /* retries while asleep */
+  CHECK(host.sent == 0);
+
+  host.busy_after = -1; /* resumed */
+  otg_ble_pump(&g_app);
+  CHECK(host.sent == 3);
+  CHECK(host.first[0] == 0x0e && host.first[1] == 0x13);
+  CHECK(host.types[2] == OTG_HCI_ACL && host.first[2] == 0xc1);
+  otg_ble_stats_t after = otg_ble_stats(&g_app);
+  CHECK(after.dropped_full == before.dropped_full);
+  CHECK(after.dropped_rejected == before.dropped_rejected);
+}
+
 int main(void) {
   test_relay_and_order();
+  test_suspend_keeps_packets();
   test_drops();
   test_reports_leave_room_for_flow_control();
   test_acl_burst_waits_for_room();
