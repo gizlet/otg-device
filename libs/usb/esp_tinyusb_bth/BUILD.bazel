@@ -1,0 +1,22 @@
+load("@gizos//tools/bazel/firmware:native_component.bzl", "firmware_native_component")
+
+package(default_visibility = ["//visibility:public"])
+
+# ESP-IDF component; compiled by the native SDK build, not by Bazel.
+# Standard USB Bluetooth controller (class 0xE0) on TinyUSB.
+firmware_native_component(
+    name = "esp_tinyusb_bth",
+    srcs = ["src/otg_usb_bth.c"],
+    hdrs = ["include/otg_usb_bth.h"],
+    component_directory = "libs/usb/esp_tinyusb_bth",
+    component_name = "otg_usb_bth",
+    data = [
+        "CMakeLists.txt",
+        "idf_component.yml",
+    ],
+    tags = ["manual"],
+    deps = [
+        "//libs/bt/hci",
+        "@gizos//pal",
+    ],
+)
