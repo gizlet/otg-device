@@ -25,7 +25,20 @@ static int g_sent;
 static uint8_t g_sent_first;
 
 static bool fake_mounted(void) { return g_mounted; }
-static bool fake_ready(void) { return g_mounted && !g_suspended; }
+/* When set, the next ready() check runs a reset first, then reports the
+ * readiness observed just before it, as a racing USB task would. */
+static otg_bth_in_t* g_reset_in_ready;
+static bool g_reset_configured;
+static bool fake_ready(void) {
+  if (g_reset_in_ready != NULL) {
+    otg_bth_in_t* ep = g_reset_in_ready;
+    g_reset_in_ready = NULL;
+    g_mounted = g_reset_configured;
+    otg_bth_in_reset(ep, g_reset_configured);
+    return true;
+  }
+  return g_mounted && !g_suspended;
+}
 static void fake_defer(void (*fn)(void*), void* arg) {
   g_deferred_fn = fn;
   g_deferred_arg = arg;
@@ -70,15 +83,15 @@ static void test_suspend_between_accept_and_submit(void) {
   CHECK(otg_bth_in_start(&ep, kEvent, sizeof(kEvent)) == H2_PAL_OK);
   g_suspended = true;
   run_deferred();
-  CHECK(g_sent == 0 && atomic_load(&ep.state) == OTG_BTH_IN_QUEUED);
+  CHECK(g_sent == 0 && otg_bth_in_state(&ep) == OTG_BTH_IN_QUEUED);
   CHECK(otg_bth_in_start(&ep, kEvent, sizeof(kEvent)) ==
         H2_PAL_ERR_WOULD_BLOCK);
   g_suspended = false;
   otg_bth_in_resume(&ep);
   CHECK(g_sent == 1 && g_sent_first == 0x13);
-  CHECK(atomic_load(&ep.state) == OTG_BTH_IN_INFLIGHT);
+  CHECK(otg_bth_in_state(&ep) == OTG_BTH_IN_INFLIGHT);
   otg_bth_in_complete(&ep);
-  CHECK(atomic_load(&ep.state) == OTG_BTH_IN_FREE && g_writable == 1);
+  CHECK(otg_bth_in_state(&ep) == OTG_BTH_IN_FREE && g_writable == 1);
 }
 
 static void test_busy_and_closed(void) {
@@ -101,11 +114,11 @@ static void test_reconfigure_and_detach(void) {
   CHECK(otg_bth_in_start(&ep, kEvent, sizeof(kEvent)) == H2_PAL_OK);
   run_deferred();
   otg_bth_in_reset(&ep, true);
-  CHECK(atomic_load(&ep.state) == OTG_BTH_IN_FREE && g_writable == 1);
+  CHECK(otg_bth_in_state(&ep) == OTG_BTH_IN_FREE && g_writable == 1);
 
   CHECK(otg_bth_in_start(&ep, kEvent, sizeof(kEvent)) == H2_PAL_OK);
   otg_bth_in_reset(&ep, true); /* before the deferred submit ran */
-  CHECK(g_sent == 2 && atomic_load(&ep.state) == OTG_BTH_IN_INFLIGHT);
+  CHECK(g_sent == 2 && otg_bth_in_state(&ep) == OTG_BTH_IN_INFLIGHT);
   run_deferred(); /* stale deferred submit is a no-op */
   CHECK(g_sent == 2);
 
@@ -113,41 +126,38 @@ static void test_reconfigure_and_detach(void) {
   CHECK(otg_bth_in_start(&ep, kEvent, sizeof(kEvent)) == H2_PAL_OK);
   g_mounted = false;
   otg_bth_in_reset(&ep, false);
-  CHECK(atomic_load(&ep.state) == OTG_BTH_IN_FREE);
+  CHECK(otg_bth_in_state(&ep) == OTG_BTH_IN_FREE);
   run_deferred();
   CHECK(g_sent == 2);
 }
 
-/* Detach while the relay fills the buffer: the fill is cancelled, the stale
- * packet is never queued, and the next configuration does not send it. */
-static void test_detach_during_fill(void) {
+/* A reset lands after start() read the session and passed its readiness
+ * checks, but before it claims the buffer (the interleaving where a reset
+ * sees FREE and the relay then claims it). The claim must fail. */
+static void test_reset_between_check_and_claim(void) {
   otg_bth_in_t ep;
   reset_fakes(&ep);
-  atomic_store(&ep.state, OTG_BTH_IN_FILLING);
-  g_mounted = false;
-  otg_bth_in_reset(&ep, false);
-  CHECK(atomic_load(&ep.state) == OTG_BTH_IN_FREE && g_writable == 1);
-
-  /* The relay's FILLING -> QUEUED step now fails and reports the drop. */
-  int expected = OTG_BTH_IN_FILLING;
-  CHECK(!atomic_compare_exchange_strong(&ep.state, &expected,
-                                        OTG_BTH_IN_QUEUED));
+  g_reset_in_ready = &ep;
+  g_reset_configured = false; /* detach */
+  CHECK(otg_bth_in_start(&ep, kEvent, sizeof(kEvent)) == H2_PAL_ERR_CLOSED);
+  CHECK(otg_bth_in_state(&ep) == OTG_BTH_IN_FREE);
   g_mounted = true;
   otg_bth_in_reset(&ep, true); /* next host configures the device */
   run_deferred();
-  CHECK(g_sent == 0 && atomic_load(&ep.state) == OTG_BTH_IN_FREE);
+  CHECK(g_sent == 0 && otg_bth_in_state(&ep) == OTG_BTH_IN_FREE);
 
-  /* Reconfiguration also cancels a fill; the relay retries afterwards. */
-  atomic_store(&ep.state, OTG_BTH_IN_FILLING);
-  otg_bth_in_reset(&ep, true);
-  CHECK(atomic_load(&ep.state) == OTG_BTH_IN_FREE);
+  /* Reconfiguration in the same window: the relay retries on the new one. */
+  g_reset_in_ready = &ep;
+  g_reset_configured = true;
+  CHECK(otg_bth_in_start(&ep, kEvent, sizeof(kEvent)) ==
+        H2_PAL_ERR_WOULD_BLOCK);
   CHECK(otg_bth_in_start(&ep, kEvent, sizeof(kEvent)) == H2_PAL_OK);
   run_deferred();
-  CHECK(g_sent == 1);
+  CHECK(g_sent == 1 && otg_bth_in_state(&ep) == OTG_BTH_IN_INFLIGHT);
 }
 
 int main(void) {
-  test_detach_during_fill();
+  test_reset_between_check_and_claim();
   test_suspend_between_accept_and_submit();
   test_busy_and_closed();
   test_reconfigure_and_detach();

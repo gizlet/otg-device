@@ -38,7 +38,8 @@ typedef struct otg_bth_in_ops {
 } otg_bth_in_ops_t;
 
 typedef struct otg_bth_in {
-  _Atomic int state;
+  /** Buffer state (low 2 bits) and session number; see otg_bth_in.c. */
+  _Atomic uint32_t state;
   uint16_t len;
   /** Submit len bytes of buf; false when the stack refuses. */
   bool (*send)(void* buf, uint16_t len);
@@ -46,6 +47,9 @@ typedef struct otg_bth_in {
   /* Owned by the USB stack from submission until completion. */
   uint8_t buf[OTG_HCI_PACKET_MAX];
 } otg_bth_in_t;
+
+/** Current buffer state (OTG_BTH_IN_FREE ... OTG_BTH_IN_INFLIGHT). */
+int otg_bth_in_state(otg_bth_in_t* ep);
 
 /** Relay task: OK once queued, WOULD_BLOCK to retry, CLOSED to drop. */
 h2_pal_result_t otg_bth_in_start(otg_bth_in_t* ep, const uint8_t* data,
@@ -55,7 +59,8 @@ h2_pal_result_t otg_bth_in_start(otg_bth_in_t* ep, const uint8_t* data,
 void otg_bth_in_submit(void* ep);
 void otg_bth_in_complete(otg_bth_in_t* ep);
 /** The configuration changed (configured) or went away (!configured).
- *  Cancels a fill in progress; the relay's start() then fails. */
+ *  Starts a new session: any claim or fill the relay began before it fails,
+ *  so a previous session's packet is never queued. */
 void otg_bth_in_reset(otg_bth_in_t* ep, bool configured);
 /** The bus resumed: submit a buffer queued while suspended. */
 void otg_bth_in_resume(otg_bth_in_t* ep);
