@@ -1,5 +1,7 @@
 #include "otg_usb_bth.h"
 
+#include "otg_bth_in.h"
+
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "sdkconfig.h"
@@ -14,6 +16,9 @@
 
 #if !CONFIG_TINYUSB_BTH_ENABLED || CONFIG_TINYUSB_BTH_ISO_ALT_COUNT != 1
 #error "otg_usb_bth needs CONFIG_TINYUSB_BTH_ENABLED and one SCO alternate"
+#endif
+#if !CONFIG_TINYUSB_RESUME_CALLBACK
+#error "otg_usb_bth needs CONFIG_TINYUSB_RESUME_CALLBACK to resubmit after resume"
 #endif
 
 /* Fixed ID for every development board running this app. Hosts bind the
@@ -78,25 +83,22 @@ static const char* s_strings[STR_COUNT] = {
 
 static const otg_hci_sink_t* s_sink;
 static otg_hci_acl_reassembler_t s_acl_out;
-/*
- * IN endpoint ownership. The relay task only fills a FREE buffer and marks it
- * QUEUED; every other transition (submit, completion, abandonment on
- * reconfiguration or detach) happens in the TinyUSB task, so resetting
- * ownership never races a transfer TinyUSB has just accepted. FILLING keeps
- * the TinyUSB task from submitting a buffer the relay is still copying.
- */
-enum { IN_FREE, IN_FILLING, IN_QUEUED, IN_INFLIGHT };
+static void notify_writable(void);
+static bool usb_mounted(void) { return tud_mounted(); }
+static bool usb_ready(void) { return tud_ready(); }
+static void usb_defer(void (*fn)(void*), void* arg) {
+  usbd_defer_func(fn, arg, false);
+}
 
-typedef struct in_ep {
-  _Atomic int state;
-  uint16_t len;
-  bool (*send)(void*, uint16_t);
-  /* Owned by TinyUSB from submission until the sent callback. */
-  uint8_t buf[OTG_HCI_PACKET_MAX];
-} in_ep_t;
-
-static in_ep_t s_event_in = {.send = tud_bt_event_send};
-static in_ep_t s_acl_in = {.send = tud_bt_acl_data_send};
+/* IN buffer ownership; see otg_bth_in.h. */
+static const otg_bth_in_ops_t s_in_ops = {
+    .mounted = usb_mounted,
+    .ready = usb_ready,
+    .defer = usb_defer,
+    .writable = notify_writable,
+};
+static otg_bth_in_t s_event_in = {.send = tud_bt_event_send, .ops = &s_in_ops};
+static otg_bth_in_t s_acl_in = {.send = tud_bt_acl_data_send, .ops = &s_in_ops};
 
 static void notify_writable(void) {
   if (s_sink != NULL && s_sink->writable != NULL) {
@@ -118,39 +120,14 @@ void tud_bt_acl_data_received_cb(void* acl_data, uint16_t data_len) {
   otg_hci_acl_feed(&s_acl_out, acl_data, data_len, s_sink);
 }
 
-/* TinyUSB task: submit a QUEUED buffer. A suspended bus leaves it QUEUED;
- * the relay's next send attempt schedules another try. */
-static void submit_in(void* param) {
-  in_ep_t* ep = param;
-  if (atomic_load(&ep->state) != IN_QUEUED || !tud_ready()) return;
-  if (ep->send(ep->buf, ep->len)) atomic_store(&ep->state, IN_INFLIGHT);
-}
-
-static void in_complete(in_ep_t* ep) {
-  atomic_store(&ep->state, IN_FREE);
-  notify_writable();
-}
-
-/* TinyUSB task: the configuration changed or went away. Transfers accepted
- * before it were abandoned with their endpoints; a queued packet is sent on
- * the new configuration, or dropped when the host has gone. */
-static void in_reset(in_ep_t* ep, bool configured) {
-  int state = atomic_load(&ep->state);
-  if (state == IN_INFLIGHT || (!configured && state == IN_QUEUED)) {
-    atomic_store(&ep->state, IN_FREE);
-  } else if (configured && state == IN_QUEUED) {
-    submit_in(ep);
-  }
-}
-
 void tud_bt_event_sent_cb(uint16_t sent_bytes) {
   (void)sent_bytes;
-  in_complete(&s_event_in);
+  otg_bth_in_complete(&s_event_in);
 }
 
 void tud_bt_acl_data_sent_cb(uint16_t sent_bytes) {
   (void)sent_bytes;
-  in_complete(&s_acl_in);
+  otg_bth_in_complete(&s_acl_in);
 }
 
 /* Runs in the TinyUSB task, inline after (re)configuration or on detach. */
@@ -163,13 +140,18 @@ static void on_usb_event(tinyusb_event_t* event, void* arg) {
     case TINYUSB_EVENT_ATTACHED:
     case TINYUSB_EVENT_DETACHED:
       break;
+    case TINYUSB_EVENT_RESUMED:
+      /* A packet accepted just before suspend is still QUEUED. */
+      otg_bth_in_resume(&s_event_in);
+      otg_bth_in_resume(&s_acl_in);
+      return;
     default:
       return;
   }
   const bool configured = event->id == TINYUSB_EVENT_ATTACHED;
   otg_hci_acl_reset(&s_acl_out);
-  in_reset(&s_event_in, configured);
-  in_reset(&s_acl_in, configured);
+  otg_bth_in_reset(&s_event_in, configured);
+  otg_bth_in_reset(&s_acl_in, configured);
   if (configured) {
     ESP_LOGI(TAG, "host configured the Bluetooth interface");
     notify_writable();
@@ -178,40 +160,15 @@ static void on_usb_event(tinyusb_event_t* event, void* arg) {
 
 /* ---- port to the host --------------------------------------------------- */
 
-/* Relay task: copy the packet into a FREE buffer and hand it to the TinyUSB
- * task. Only an unconfigured device drops the packet; a busy endpoint or a
- * suspended bus returns WOULD_BLOCK and the relay retries. */
-static h2_pal_result_t start_in(in_ep_t* ep, const uint8_t* data,
-                                size_t len) {
-  if (!tud_mounted()) return H2_PAL_ERR_CLOSED;
-  int state = atomic_load(&ep->state);
-  if (state == IN_QUEUED && tud_ready()) {
-    usbd_defer_func(submit_in, ep, false); /* retry after resume */
-  }
-  if (state != IN_FREE || !tud_ready()) return H2_PAL_ERR_WOULD_BLOCK;
-  int expected = IN_FREE;
-  if (!atomic_compare_exchange_strong(&ep->state, &expected, IN_FILLING)) {
-    return H2_PAL_ERR_WOULD_BLOCK;
-  }
-  memcpy(ep->buf, data, len);
-  ep->len = (uint16_t)len;
-  expected = IN_FILLING;
-  if (!atomic_compare_exchange_strong(&ep->state, &expected, IN_QUEUED)) {
-    return H2_PAL_ERR_WOULD_BLOCK; /* detached meanwhile; retry */
-  }
-  usbd_defer_func(submit_in, ep, false);
-  return H2_PAL_OK;
-}
-
 static h2_pal_result_t port_send(void* user, otg_hci_type_t type,
                                  const uint8_t* data, size_t len) {
   (void)user;
   if (len == 0u || len > OTG_HCI_PACKET_MAX) return H2_PAL_ERR_INVALID_ARG;
   switch (type) {
     case OTG_HCI_EVENT:
-      return start_in(&s_event_in, data, len);
+      return otg_bth_in_start(&s_event_in, data, len);
     case OTG_HCI_ACL:
-      return start_in(&s_acl_in, data, len);
+      return otg_bth_in_start(&s_acl_in, data, len);
     default:
       return H2_PAL_ERR_UNSUPPORTED;
   }

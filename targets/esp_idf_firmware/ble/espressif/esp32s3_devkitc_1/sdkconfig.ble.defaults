@@ -19,5 +19,7 @@ CONFIG_BT_CTRL_HCI_MODE_VHCI=y
 # Standard USB Bluetooth class with one zero-bandwidth SCO alternate.
 CONFIG_TINYUSB_BTH_ENABLED=y
 CONFIG_TINYUSB_BTH_ISO_ALT_COUNT=1
+# Resubmit IN packets queued while the bus was suspended.
+CONFIG_TINYUSB_RESUME_CALLBACK=y
 # CONFIG_TINYUSB_CDC_ENABLED is not set
 # CONFIG_TINYUSB_MSC_ENABLED is not set
