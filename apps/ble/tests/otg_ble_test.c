@@ -268,14 +268,10 @@ static void test_reports_leave_room_for_flow_control(void) {
 /* A burst of controller ACL data while bulk IN stays busy must wait for room,
  * not lose fragments, and the pump must not call the controller meanwhile. */
 static fake_port_t* g_burst_host;
-static fake_port_t* g_burst_controller;
-static int g_burst_controller_sent_at_wait;
 
 static void free_one_host_slot(void) {
-  g_burst_controller_sent_at_wait = g_burst_controller->sent;
   g_burst_host->busy_after = g_burst_host->sent + 1; /* host reads one */
   otg_ble_pump(&g_app);
-  CHECK(g_burst_controller->sent == g_burst_controller_sent_at_wait);
 }
 
 static void test_acl_burst_waits_for_room(void) {
@@ -286,8 +282,8 @@ static void test_acl_burst_waits_for_room(void) {
                                           .send = fake_send};
   otg_ble_attach(&g_app, &controller_port, &host_port);
   g_burst_host = &host;
-  g_burst_controller = &controller;
   g_on_space_wait = free_one_host_slot;
+  g_space_waits = 0;
   const otg_hci_sink_t* from_host = otg_ble_host_sink(&g_app);
   const otg_hci_sink_t* from_controller = otg_ble_controller_sink(&g_app);
   otg_ble_stats_t before = otg_ble_stats(&g_app);
@@ -353,8 +349,58 @@ static void test_suspend_keeps_packets(void) {
   CHECK(after.dropped_rejected == before.dropped_rejected);
 }
 
+/* The host stops reading bulk IN, the ACL queue fills and the controller's
+ * receive callback waits. A host HCI_Reset must still reach the controller,
+ * and it frees the waiter by flushing the stale host-bound packets. */
+static fake_port_t* g_reset_controller;
+static const otg_hci_sink_t* g_reset_from_host;
+
+static void send_reset_while_waiting(void) {
+  const uint8_t reset[3] = {0x03, 0x0c, 0};
+  g_reset_from_host->receive(g_reset_from_host->user, OTG_HCI_COMMAND, reset,
+                             sizeof(reset));
+  otg_ble_pump(&g_app);
+  CHECK(g_reset_controller->sent == 1);
+  CHECK(g_reset_controller->types[0] == OTG_HCI_COMMAND &&
+        g_reset_controller->first[0] == 0x03);
+}
+
+static void test_reset_recovers_blocked_host(void) {
+  fake_port_t host = {.busy_after = 0}; /* never reads */
+  const otg_hci_port_t host_port = {.user = &host, .send = fake_send};
+  fake_port_t controller = {.busy_after = -1};
+  const otg_hci_port_t controller_port = {.user = &controller,
+                                          .send = fake_send};
+  otg_ble_attach(&g_app, &controller_port, &host_port);
+  g_reset_controller = &controller;
+  g_reset_from_host = otg_ble_host_sink(&g_app);
+  g_on_space_wait = send_reset_while_waiting;
+  g_space_waits = 0;
+  const otg_hci_sink_t* from_controller = otg_ble_controller_sink(&g_app);
+  otg_ble_stats_t before = otg_ble_stats(&g_app);
+
+  for (unsigned i = 0; i <= OTG_BLE_TO_HOST_ACL_DEPTH; i++) {
+    deliver(from_controller, OTG_HCI_ACL, (uint8_t)i, 27u);
+  }
+  CHECK(g_space_waits == 1); /* the reset ended the only wait */
+  otg_ble_stats_t after = otg_ble_stats(&g_app);
+  CHECK(after.flushed_on_reset - before.flushed_on_reset ==
+        OTG_BLE_TO_HOST_ACL_DEPTH + 1u);
+  CHECK(after.dropped_full == before.dropped_full);
+
+  /* The reset's Command Complete, queued after the flush, is delivered. */
+  g_on_space_wait = NULL;
+  const uint8_t complete[6] = {0x0e, 4, 1, 0x03, 0x0c, 0};
+  from_controller->receive(from_controller->user, OTG_HCI_EVENT, complete,
+                           sizeof(complete));
+  host.busy_after = -1;
+  otg_ble_pump(&g_app);
+  CHECK(host.sent == 1 && host.first[0] == 0x0e);
+}
+
 int main(void) {
   test_relay_and_order();
+  test_reset_recovers_blocked_host();
   test_suspend_keeps_packets();
   test_drops();
   test_reports_leave_room_for_flow_control();

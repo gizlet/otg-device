@@ -86,8 +86,8 @@ static void enqueue(otg_ble_t* app, otg_ble_queue_t* queue,
 /* Runs in the controller's task. Advertising reports beyond their share are
  * dropped; every other packet waits for room while a host is attached, so the
  * controller's own buffers and link-layer flow control absorb a slow host
- * instead of the relay losing an ACL fragment or a credit-bearing event. The
- * pump does not call into the controller during the wait. */
+ * instead of the relay losing an ACL fragment or a credit-bearing event. A
+ * flush for HCI_Reset during the wait discards the packet instead. */
 static void enqueue_from_controller(otg_ble_t* app, otg_ble_queue_t* queue,
                                     otg_hci_type_t type, bool report,
                                     const uint8_t* data, size_t len) {
@@ -99,6 +99,7 @@ static void enqueue_from_controller(otg_ble_t* app, otg_ble_queue_t* queue,
   }
   bool waited = false;
   lock(app);
+  const uint32_t generation = app->flush_generation;
   while (!queue_push(queue, type, report, data, len)) {
     if (report) {
       app->stats.dropped_reports++;
@@ -112,13 +113,15 @@ static void enqueue_from_controller(otg_ble_t* app, otg_ble_queue_t* queue,
       app->stats.backpressure_waits++;
       waited = true;
     }
-    app->controller_waiting = true;
     unlock(app);
     wake(app);
     (void)h2_pal_semaphore_take(app->runtime->sync, app->space, SPACE_WAIT_MS);
     lock(app);
+    if (app->flush_generation != generation) {
+      app->stats.flushed_on_reset++;
+      break;
+    }
   }
-  app->controller_waiting = false;
   unlock(app);
   wake(app);
 }
@@ -157,6 +160,30 @@ static void from_host(void* user, otg_hci_type_t type, const uint8_t* data,
 
 /* ---- pump --------------------------------------------------------------- */
 
+static bool is_hci_reset(const otg_ble_packet_t* packet) {
+  /* Opcode 0x0C03, little-endian (Vol 4, Part E, 7.3.2). */
+  return packet->type == OTG_HCI_COMMAND && packet->len >= 3u &&
+         packet->data[0] == 0x03 && packet->data[1] == 0x0c;
+}
+
+static void flush_queue(otg_ble_t* app, otg_ble_queue_t* queue) {
+  app->stats.flushed_on_reset += (uint32_t)queue->count;
+  queue->head = 0u;
+  queue->count = 0u;
+  queue->report_count = 0u;
+}
+
+/* Called by the pump, the only remover, before HCI_Reset reaches the
+ * controller, so the reset's own Command Complete is never discarded. */
+static void flush_to_host(otg_ble_t* app) {
+  lock(app);
+  flush_queue(app, &app->to_host_event);
+  flush_queue(app, &app->to_host_acl);
+  app->flush_generation++;
+  unlock(app);
+  (void)h2_pal_semaphore_give(app->runtime->sync, app->space);
+}
+
 /* Only the pumping task removes packets, so the head slot stays valid while
  * it is being sent with the lock released; producers only append. */
 static void drain(otg_ble_t* app, otg_ble_queue_t* queue,
@@ -170,6 +197,10 @@ static void drain(otg_ble_t* app, otg_ble_queue_t* queue,
     }
     otg_ble_packet_t* packet = &queue->slots[queue->head];
     unlock(app);
+
+    if (queue == &app->to_controller && is_hci_reset(packet)) {
+      flush_to_host(app);
+    }
 
     h2_pal_result_t rc =
         otg_hci_port_send(port, packet->type, packet->data, packet->len);
@@ -189,15 +220,9 @@ static void drain(otg_ble_t* app, otg_ble_queue_t* queue,
 
 void otg_ble_pump(otg_ble_t* app) {
   if (app == NULL) return;
-  lock(app);
-  bool controller_busy = app->controller_waiting;
-  unlock(app);
-  /* A waiting receive callback holds the controller's task; sending to the
-   * controller then could wait on it in turn. */
-  if (!controller_busy) {
-    drain(app, &app->to_controller, app->controller,
-          &app->stats.to_controller);
-  }
+  /* Ports never block, so commands still reach the controller's own queue
+   * while its receive callback waits for room here. */
+  drain(app, &app->to_controller, app->controller, &app->stats.to_controller);
   drain(app, &app->to_host_event, app->host, &app->stats.to_host);
   drain(app, &app->to_host_acl, app->host, &app->stats.to_host);
 }

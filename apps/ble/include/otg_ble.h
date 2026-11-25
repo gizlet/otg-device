@@ -23,7 +23,13 @@
  * their queue is full, the controller's receive callback waits until the host
  * side drains a slot. The controller keeps further packets in its own buffers
  * meanwhile, and link-layer flow control holds back the peer. Host-to-controller
- * traffic needs no wait: the controller's command and ACL credits bound it.
+ * traffic needs no wait: the controller's command and ACL credits bound it,
+ * and the pump keeps delivering it while a receive callback waits, so a host
+ * can still recover a stalled link.
+ *
+ * Sending HCI_Reset to the controller discards every packet still queued for
+ * the host, including one a receive callback is waiting to queue: a reset
+ * invalidates them, and it frees a host that stopped reading.
  */
 
 #include "h2_runtime.h"
@@ -75,6 +81,8 @@ typedef struct otg_ble_stats {
   uint32_t dropped_reports;
   uint32_t dropped_rejected;
   uint32_t dropped_unsupported;
+  /** Host-bound packets discarded when HCI_Reset was sent. */
+  uint32_t flushed_on_reset;
 } otg_ble_stats_t;
 
 /**
@@ -91,8 +99,8 @@ typedef struct otg_ble {
   h2_pal_semaphore_t* wake;
   /** Given whenever the pump frees a queue slot. */
   h2_pal_semaphore_t* space;
-  /** The controller's receive callback is waiting for a free slot. */
-  bool controller_waiting;
+  /** Incremented each time host-bound queues are flushed for HCI_Reset. */
+  uint32_t flush_generation;
 
   otg_ble_queue_t to_controller;
   otg_ble_queue_t to_host_event;
