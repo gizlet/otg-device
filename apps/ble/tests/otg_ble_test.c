@@ -197,9 +197,56 @@ static void test_drops(void) {
   CHECK(host.first[0] == 0 && host.first[15] == 15);
 }
 
+/* A scan floods advertising reports while the event endpoint is busy; the
+ * Command Complete that follows must still reach the host. */
+static void test_reports_leave_room_for_flow_control(void) {
+  fake_port_t host = {.busy_after = 0};
+  const otg_hci_port_t host_port = {.user = &host, .send = fake_send};
+  fake_port_t controller = {.busy_after = -1};
+  const otg_hci_port_t controller_port = {.user = &controller,
+                                          .send = fake_send};
+  otg_ble_attach(&g_app, &controller_port, &host_port);
+  const otg_hci_sink_t* from_controller = otg_ble_controller_sink(&g_app);
+  otg_ble_stats_t before = otg_ble_stats(&g_app);
+
+  uint8_t report[12] = {0x3e, 10, 0x02, 1};
+  for (unsigned i = 0; i < 40u; i++) {
+    from_controller->receive(from_controller->user, OTG_HCI_EVENT, report,
+                             sizeof(report));
+  }
+  const uint8_t complete[6] = {0x0e, 4, 1, 0x03, 0x0c, 0};
+  from_controller->receive(from_controller->user, OTG_HCI_EVENT, complete,
+                           sizeof(complete));
+  const uint8_t completed_packets[7] = {0x13, 5, 1, 0x40, 0, 1, 0};
+  from_controller->receive(from_controller->user, OTG_HCI_EVENT,
+                           completed_packets, sizeof(completed_packets));
+  otg_ble_pump(&g_app);
+  otg_ble_stats_t after = otg_ble_stats(&g_app);
+  CHECK(after.dropped_reports - before.dropped_reports ==
+        40u - OTG_BLE_ADV_REPORT_MAX);
+  CHECK(after.dropped_full == before.dropped_full);
+
+  host.busy_after = -1;
+  otg_ble_pump(&g_app);
+  CHECK(host.sent == (int)OTG_BLE_ADV_REPORT_MAX + 2);
+  CHECK(host.first[OTG_BLE_ADV_REPORT_MAX] == 0x0e);
+  CHECK(host.first[OTG_BLE_ADV_REPORT_MAX + 1] == 0x13);
+
+  /* Delivered reports free their slots for the next scan window. */
+  host.busy_after = host.sent;
+  for (unsigned i = 0; i < OTG_BLE_ADV_REPORT_MAX; i++) {
+    from_controller->receive(from_controller->user, OTG_HCI_EVENT, report,
+                             sizeof(report));
+  }
+  CHECK(otg_ble_stats(&g_app).dropped_reports == after.dropped_reports);
+  host.busy_after = -1;
+  otg_ble_pump(&g_app);
+}
+
 int main(void) {
   test_relay_and_order();
   test_drops();
+  test_reports_leave_room_for_flow_control();
   otg_ble_deinit(&g_app);
   if (failures != 0) {
     fprintf(stderr, "%d check(s) failed\n", failures);

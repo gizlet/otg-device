@@ -117,7 +117,16 @@ void tud_bt_acl_data_sent_cb(uint16_t sent_bytes) {
 
 static void on_usb_event(tinyusb_event_t* event, void* arg) {
   (void)arg;
-  /* A bus reset or detach abandons in-flight transfers and partial input. */
+  /* Only detach and (re)configuration abandon in-flight transfers and
+   * partial input. Suspend and resume keep TinyUSB's transfers pending, so
+   * IN buffers stay owned by TinyUSB and ACL reassembly continues. */
+  switch (event->id) {
+    case TINYUSB_EVENT_ATTACHED:
+    case TINYUSB_EVENT_DETACHED:
+      break;
+    default:
+      return;
+  }
   otg_hci_acl_reset(&s_acl_out);
   atomic_store(&s_event_busy, false);
   atomic_store(&s_acl_busy, false);

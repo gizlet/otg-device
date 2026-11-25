@@ -8,30 +8,42 @@
 /* ---- queues (caller holds app->lock) ----------------------------------- */
 
 static void queue_init(otg_ble_queue_t* queue, otg_ble_packet_t* slots,
-                       size_t capacity) {
+                       size_t capacity, size_t report_max) {
   memset(queue, 0, sizeof(*queue));
   queue->slots = slots;
   queue->capacity = capacity;
+  queue->report_max = report_max;
 }
 
 static bool queue_push(otg_ble_queue_t* queue, otg_hci_type_t type,
-                       const uint8_t* data, size_t len) {
-  if (queue->count == queue->capacity) {
+                       bool report, const uint8_t* data, size_t len) {
+  if (queue->count == queue->capacity ||
+      (report && queue->report_count >= queue->report_max)) {
     queue->dropped++;
     return false;
   }
   otg_ble_packet_t* slot =
       &queue->slots[(queue->head + queue->count) % queue->capacity];
   slot->type = type;
+  slot->report = report;
   slot->len = (uint16_t)len;
   memcpy(slot->data, data, len);
   queue->count++;
+  if (report) queue->report_count++;
   return true;
 }
 
 static void queue_pop(otg_ble_queue_t* queue) {
+  if (queue->slots[queue->head].report) queue->report_count--;
   queue->head = (queue->head + 1u) % queue->capacity;
   queue->count--;
+}
+
+/* LE Meta event carrying an advertising report: legacy (0x02), directed
+ * (0x0B) or extended (0x0D). Bluetooth Core, Vol 4, Part E, 7.7.65. */
+static bool is_advertising_report(const uint8_t* data, size_t len) {
+  if (len < 3u || data[0] != 0x3e) return false;
+  return data[2] == 0x02 || data[2] == 0x0b || data[2] == 0x0d;
 }
 
 /* ---- sinks -------------------------------------------------------------- */
@@ -50,7 +62,8 @@ static void wake(void* user) {
 }
 
 static void enqueue(otg_ble_t* app, otg_ble_queue_t* queue,
-                    otg_hci_type_t type, const uint8_t* data, size_t len) {
+                    otg_hci_type_t type, bool report, const uint8_t* data,
+                    size_t len) {
   if (len > OTG_HCI_PACKET_MAX || (data == NULL && len > 0u)) {
     lock(app);
     app->stats.dropped_rejected++;
@@ -58,7 +71,13 @@ static void enqueue(otg_ble_t* app, otg_ble_queue_t* queue,
     return;
   }
   lock(app);
-  if (!queue_push(queue, type, data, len)) app->stats.dropped_full++;
+  if (!queue_push(queue, type, report, data, len)) {
+    if (report) {
+      app->stats.dropped_reports++;
+    } else {
+      app->stats.dropped_full++;
+    }
+  }
   unlock(app);
   wake(app);
 }
@@ -68,10 +87,11 @@ static void from_controller(void* user, otg_hci_type_t type,
   otg_ble_t* app = user;
   switch (type) {
     case OTG_HCI_EVENT:
-      enqueue(app, &app->to_host_event, type, data, len);
+      enqueue(app, &app->to_host_event, type,
+              data != NULL && is_advertising_report(data, len), data, len);
       return;
     case OTG_HCI_ACL:
-      enqueue(app, &app->to_host_acl, type, data, len);
+      enqueue(app, &app->to_host_acl, type, false, data, len);
       return;
     default:
       lock(app);
@@ -90,7 +110,7 @@ static void from_host(void* user, otg_hci_type_t type, const uint8_t* data,
     unlock(app);
     return;
   }
-  enqueue(app, &app->to_controller, type, data, len);
+  enqueue(app, &app->to_controller, type, false, data, len);
 }
 
 /* ---- pump --------------------------------------------------------------- */
@@ -145,11 +165,11 @@ h2_pal_result_t otg_ble_init(otg_ble_t* app, const h2_runtime_t* runtime) {
   memset(app, 0, sizeof(*app));
   app->runtime = runtime;
   queue_init(&app->to_controller, app->to_controller_slots,
-             OTG_BLE_TO_CONTROLLER_DEPTH);
+             OTG_BLE_TO_CONTROLLER_DEPTH, 0u);
   queue_init(&app->to_host_event, app->to_host_event_slots,
-             OTG_BLE_TO_HOST_EVENT_DEPTH);
+             OTG_BLE_TO_HOST_EVENT_DEPTH, OTG_BLE_ADV_REPORT_MAX);
   queue_init(&app->to_host_acl, app->to_host_acl_slots,
-             OTG_BLE_TO_HOST_ACL_DEPTH);
+             OTG_BLE_TO_HOST_ACL_DEPTH, 0u);
   app->controller_sink =
       (otg_hci_sink_t){.user = app, .receive = from_controller, .writable = wake};
   app->host_sink =

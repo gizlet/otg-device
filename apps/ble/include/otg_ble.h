@@ -12,12 +12,19 @@
  * Commands and host ACL data are queued for the controller in arrival order.
  * Controller events and ACL data use separate queues because the USB class
  * carries them on separate endpoints; a busy ACL endpoint never delays events.
+ *
+ * Advertising reports may fill at most OTG_BLE_ADV_REPORT_MAX event slots and
+ * are dropped beyond that, as a scan can produce them faster than the host
+ * reads them. The remaining slots stay free for events that carry HCI flow
+ * control (Command Complete, Command Status, Number Of Completed Packets) and
+ * connection state, whose count the host's command and ACL credits bound.
  */
 
 #include "h2_runtime.h"
 #include "otg_hci.h"
 #include "os/h2_pal_sync.h"
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -31,11 +38,14 @@ extern "C" {
 #define OTG_BLE_TASK_STACK_SIZE 4096u
 
 #define OTG_BLE_TO_CONTROLLER_DEPTH 16u
-#define OTG_BLE_TO_HOST_EVENT_DEPTH 16u
+#define OTG_BLE_TO_HOST_EVENT_DEPTH 32u
+#define OTG_BLE_ADV_REPORT_MAX 16u
 #define OTG_BLE_TO_HOST_ACL_DEPTH 8u
 
 typedef struct otg_ble_packet {
   otg_hci_type_t type;
+  /** An advertising report, counted against the queue's report limit. */
+  bool report;
   uint16_t len;
   uint8_t data[OTG_HCI_PACKET_MAX];
 } otg_ble_packet_t;
@@ -45,6 +55,8 @@ typedef struct otg_ble_queue {
   size_t capacity;
   size_t head;
   size_t count;
+  size_t report_count;
+  size_t report_max;
   uint32_t dropped;
 } otg_ble_queue_t;
 
@@ -52,6 +64,8 @@ typedef struct otg_ble_stats {
   uint32_t to_controller;
   uint32_t to_host;
   uint32_t dropped_full;
+  /** Advertising reports dropped at OTG_BLE_ADV_REPORT_MAX. */
+  uint32_t dropped_reports;
   uint32_t dropped_rejected;
   uint32_t dropped_unsupported;
 } otg_ble_stats_t;
