@@ -18,6 +18,12 @@
  * reads them. The remaining slots stay free for events that carry HCI flow
  * control (Command Complete, Command Status, Number Of Completed Packets) and
  * connection state, whose count the host's command and ACL credits bound.
+ *
+ * Other controller packets are never dropped while a host is attached: when
+ * their queue is full, the controller's receive callback waits until the host
+ * side drains a slot. The controller keeps further packets in its own buffers
+ * meanwhile, and link-layer flow control holds back the peer. Host-to-controller
+ * traffic needs no wait: the controller's command and ACL credits bound it.
  */
 
 #include "h2_runtime.h"
@@ -57,13 +63,14 @@ typedef struct otg_ble_queue {
   size_t count;
   size_t report_count;
   size_t report_max;
-  uint32_t dropped;
 } otg_ble_queue_t;
 
 typedef struct otg_ble_stats {
   uint32_t to_controller;
   uint32_t to_host;
   uint32_t dropped_full;
+  /** Controller packets that waited for room in a full host queue. */
+  uint32_t backpressure_waits;
   /** Advertising reports dropped at OTG_BLE_ADV_REPORT_MAX. */
   uint32_t dropped_reports;
   uint32_t dropped_rejected;
@@ -82,6 +89,10 @@ typedef struct otg_ble {
   otg_hci_sink_t host_sink;
   h2_pal_mutex_t* lock;
   h2_pal_semaphore_t* wake;
+  /** Given whenever the pump frees a queue slot. */
+  h2_pal_semaphore_t* space;
+  /** The controller's receive callback is waiting for a free slot. */
+  bool controller_waiting;
 
   otg_ble_queue_t to_controller;
   otg_ble_queue_t to_host_event;

@@ -18,8 +18,13 @@ static int failures;
 
 static int g_lock_depth;
 static int g_wakes;
+static int g_space_gives;
 static h2_pal_mutex_t* const kMutex = (h2_pal_mutex_t*)&g_lock_depth;
 static h2_pal_semaphore_t* const kSem = (h2_pal_semaphore_t*)&g_wakes;
+static h2_pal_semaphore_t* const kSpace = (h2_pal_semaphore_t*)&g_space_gives;
+/* Runs when the relay waits for space, standing in for the pump task. */
+static void (*g_on_space_wait)(void);
+static int g_space_waits;
 
 static h2_pal_result_t create_mutex(void* user,
                                     const h2_pal_mutex_config_t* config,
@@ -51,8 +56,7 @@ static h2_pal_result_t create_sem(void* user,
                                   const h2_pal_semaphore_config_t* config,
                                   h2_pal_semaphore_t** out) {
   (void)user;
-  (void)config;
-  *out = kSem;
+  *out = strcmp(config->name, "ble/space") == 0 ? kSpace : kSem;
   return H2_PAL_OK;
 }
 static h2_pal_result_t destroy_sem(void* user, h2_pal_semaphore_t* sem) {
@@ -62,8 +66,25 @@ static h2_pal_result_t destroy_sem(void* user, h2_pal_semaphore_t* sem) {
 }
 static h2_pal_result_t give_sem(void* user, h2_pal_semaphore_t* sem) {
   (void)user;
-  (void)sem;
-  g_wakes++;
+  if (sem == kSpace) {
+    g_space_gives++;
+  } else {
+    g_wakes++;
+  }
+  return H2_PAL_OK;
+}
+static h2_pal_result_t take_sem(void* user, h2_pal_semaphore_t* sem,
+                                uint32_t timeout_ms) {
+  (void)user;
+  (void)timeout_ms;
+  CHECK(sem == kSpace);
+  CHECK(g_lock_depth == 0); /* never waits with the queue lock held */
+  g_space_waits++;
+  if (g_on_space_wait == NULL || g_space_waits > 100) {
+    fprintf(stderr, "relay waited for space with no pump to free it\n");
+    exit(EXIT_FAILURE);
+  }
+  g_on_space_wait();
   return H2_PAL_OK;
 }
 static const h2_pal_sync_vtable_t kSyncVtable = {
@@ -74,6 +95,7 @@ static const h2_pal_sync_vtable_t kSyncVtable = {
     .create_semaphore = create_sem,
     .destroy_semaphore = destroy_sem,
     .give_semaphore = give_sem,
+    .take_semaphore = take_sem,
 };
 static const h2_pal_sync_api_t kSync = {.vtable = &kSyncVtable};
 
@@ -175,7 +197,7 @@ static void test_drops(void) {
   const otg_hci_sink_t* from_host = otg_ble_host_sink(&g_app);
   const otg_hci_sink_t* from_controller = otg_ble_controller_sink(&g_app);
 
-  for (unsigned i = 0; i < OTG_BLE_TO_HOST_EVENT_DEPTH + 2u; i++) {
+  for (unsigned i = 0; i < OTG_BLE_TO_HOST_EVENT_DEPTH; i++) {
     deliver(from_controller, OTG_HCI_EVENT, (uint8_t)i, 4u);
   }
   deliver(from_controller, OTG_HCI_SCO, 0, 4u);
@@ -186,7 +208,7 @@ static void test_drops(void) {
   otg_ble_pump(&g_app);
 
   otg_ble_stats_t stats = otg_ble_stats(&g_app);
-  CHECK(stats.dropped_full == 2u);
+  CHECK(stats.dropped_full == 0u);
   CHECK(stats.dropped_unsupported == 2u);
   CHECK(stats.dropped_rejected == 2u); /* oversize + CLOSED */
   CHECK(controller.sent == 1 && controller.first[0] == 0x02);
@@ -243,10 +265,66 @@ static void test_reports_leave_room_for_flow_control(void) {
   otg_ble_pump(&g_app);
 }
 
+/* A burst of controller ACL data while bulk IN stays busy must wait for room,
+ * not lose fragments, and the pump must not call the controller meanwhile. */
+static fake_port_t* g_burst_host;
+static fake_port_t* g_burst_controller;
+static int g_burst_controller_sent_at_wait;
+
+static void free_one_host_slot(void) {
+  g_burst_controller_sent_at_wait = g_burst_controller->sent;
+  g_burst_host->busy_after = g_burst_host->sent + 1; /* host reads one */
+  otg_ble_pump(&g_app);
+  CHECK(g_burst_controller->sent == g_burst_controller_sent_at_wait);
+}
+
+static void test_acl_burst_waits_for_room(void) {
+  fake_port_t host = {.busy_after = 0};
+  const otg_hci_port_t host_port = {.user = &host, .send = fake_send};
+  fake_port_t controller = {.busy_after = -1};
+  const otg_hci_port_t controller_port = {.user = &controller,
+                                          .send = fake_send};
+  otg_ble_attach(&g_app, &controller_port, &host_port);
+  g_burst_host = &host;
+  g_burst_controller = &controller;
+  g_on_space_wait = free_one_host_slot;
+  const otg_hci_sink_t* from_host = otg_ble_host_sink(&g_app);
+  const otg_hci_sink_t* from_controller = otg_ble_controller_sink(&g_app);
+  otg_ble_stats_t before = otg_ble_stats(&g_app);
+
+  /* A host command queued for the controller stays queued during the wait. */
+  deliver(from_host, OTG_HCI_COMMAND, 0x05, 3u);
+  const unsigned burst = OTG_BLE_TO_HOST_ACL_DEPTH + 4u;
+  for (unsigned i = 0; i < burst; i++) {
+    deliver(from_controller, OTG_HCI_ACL, (uint8_t)(0x80 + i), 27u);
+  }
+  CHECK(g_space_waits == 4);
+  otg_ble_stats_t after = otg_ble_stats(&g_app);
+  CHECK(after.dropped_full == before.dropped_full);
+  CHECK(after.backpressure_waits - before.backpressure_waits == 4u);
+
+  host.busy_after = -1;
+  g_on_space_wait = NULL;
+  otg_ble_pump(&g_app);
+  CHECK(host.sent == (int)burst);
+  for (unsigned i = 0; i < burst; i++) {
+    CHECK(host.types[i] == OTG_HCI_ACL && host.first[i] == 0x80 + i);
+  }
+  CHECK(controller.sent == 1 && controller.first[0] == 0x05);
+
+  /* Without a host there is nobody to wait for: the packet is dropped. */
+  otg_ble_attach(&g_app, &controller_port, NULL);
+  for (unsigned i = 0; i <= OTG_BLE_TO_HOST_ACL_DEPTH; i++) {
+    deliver(from_controller, OTG_HCI_ACL, 0x01, 5u);
+  }
+  CHECK(otg_ble_stats(&g_app).dropped_full == after.dropped_full + 1u);
+}
+
 int main(void) {
   test_relay_and_order();
   test_drops();
   test_reports_leave_room_for_flow_control();
+  test_acl_burst_waits_for_room();
   otg_ble_deinit(&g_app);
   if (failures != 0) {
     fprintf(stderr, "%d check(s) failed\n", failures);

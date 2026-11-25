@@ -26,6 +26,8 @@ static void on_send_available(void) {
   }
 }
 
+/* The sink may wait here until the host side has room; the controller keeps
+ * later packets in its own buffers meanwhile. */
 static int on_receive(uint8_t* data, uint16_t len) {
   if (s_sink == NULL || s_sink->receive == NULL || data == NULL || len < 2u) {
     return 0;
