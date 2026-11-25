@@ -1,0 +1,155 @@
+name: CI
+
+# Command-gated CI. Pull requests run it from a comment with a `/ci` line,
+# posted by gizlet-bot when the pull request is opened or updated, or by a
+# writer to run it again. It reports the required `CI` check on the
+# pull-request head. Comment events run this file from main, so a pull request
+# cannot rewrite its own required check. Do not add a pull_request trigger.
+
+on:
+  issue_comment:
+    types: [created]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      pull_request_number:
+        description: Pull request to run for; leave empty to run on the selected branch.
+        required: false
+        default: ''
+        type: string
+      head_sha:
+        description: Expected pull-request head; a moved head is skipped.
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  start:
+    # Every new comment starts this workflow; only one with a /ci line goes on.
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.pull_request_number != '')
+      || (github.event_name == 'issue_comment' && github.event.issue.pull_request
+          && contains(github.event.comment.body, '/ci'))
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: write
+    uses: gizlet/.github/.github/workflows/pr-check-start.yml@latest
+    with:
+      check-name: CI
+      command: /ci
+      pull_request_number: ${{ inputs.pull_request_number }}
+      head_sha: ${{ inputs.head_sha }}
+
+  build:
+    name: Build and test
+    needs: start
+    if: >-
+      !cancelled() && (
+        needs.start.outputs.run == 'true'
+        || (needs.start.result == 'skipped' && github.event_name != 'issue_comment'))
+    # The build runs on the self-hosted ARM64 Linux runner that the RUNNERS
+    # organization variable maps to linux-arm64, falling back to GitHub's ARM64
+    # runner.
+    runs-on: ${{ fromJSON(vars.RUNNERS || '{}')['linux-arm64'] || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 60
+    # The job runs pull-request code: read-only token and no secrets.
+    permissions:
+      contents: read
+    concurrency:
+      group: ci-${{ needs.start.outputs.number || github.ref }}
+      cancel-in-progress: ${{ needs.start.outputs.number != '' }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.start.outputs.head_sha || github.sha }}
+          persist-credentials: false
+
+      # Nothing to build before the first Bazel workspace lands.
+      - name: Detect Bazel workspace
+        id: workspace
+        run: |
+          if [ -f MODULE.bazel ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No MODULE.bazel; skipping the Bazel build."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Host tests compile with the system C compiler.
+      - name: Install build tools
+        if: steps.workspace.outputs.present == 'true'
+        run: |
+          if command -v cc >/dev/null && command -v git >/dev/null; then exit 0; fi
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends build-essential git
+
+      # GitHub-hosted images ship Bazelisk as `bazel`; self-hosted images may not.
+      - name: Install Bazelisk
+        if: steps.workspace.outputs.present == 'true'
+        env:
+          BAZELISK_VERSION: v1.30.0
+        run: |
+          set -eu
+          if command -v bazel >/dev/null; then exit 0; fi
+          case "$(uname -m)" in
+            aarch64|arm64) arch=arm64 sha=b2bcc040c213b44586b121bda6d983c35df121b917c3a7a66fb16f2fa0df1a4f ;;
+            x86_64|amd64) arch=amd64 sha=a248ae2b2b62b5baebb748f6fba7203bff1a27e5d01b55399a8406744cb539e8 ;;
+            *) echo "::error::Unsupported architecture $(uname -m)"; exit 1 ;;
+          esac
+          dir="$RUNNER_TEMP/bazelisk"
+          mkdir -p "$dir"
+          curl -fsSL -o "$dir/bazel" \
+            "https://github.com/bazelbuild/bazelisk/releases/download/$BAZELISK_VERSION/bazelisk-linux-$arch"
+          echo "$sha  $dir/bazel" | sha256sum -c -
+          chmod +x "$dir/bazel"
+          echo "$dir" >> "$GITHUB_PATH"
+
+      # GitHub-hosted runs use the Actions cache; only main writes it.
+      # Self-hosted runs keep Bazel caches on BAZEL_CACHE_DIR when it is set.
+      - uses: bazel-contrib/setup-bazel@f34d6a05eae3c24acab7fa54587492daeaeffdab # 0.19.2
+        if: steps.workspace.outputs.present == 'true'
+        with:
+          bazelisk-cache: ${{ runner.environment == 'github-hosted' }}
+          repository-cache: ${{ runner.environment == 'github-hosted' }}
+          disk-cache: ${{ runner.environment == 'github-hosted' && github.workflow || 'false' }}
+          cache-save: ${{ runner.environment == 'github-hosted' && github.event_name == 'push' }}
+
+      - name: Select persistent Bazel caches
+        env:
+          BAZEL_CACHE_DIR: ${{ vars.BAZEL_CACHE_DIR }}
+        if: steps.workspace.outputs.present == 'true' && runner.environment == 'self-hosted' && vars.BAZEL_CACHE_DIR != ''
+        run: |
+          set -eu
+          mkdir -p "$BAZEL_CACHE_DIR/disk" "$BAZEL_CACHE_DIR/repository"
+          {
+            printf 'common --disk_cache="%s/disk"\n' "$BAZEL_CACHE_DIR"
+            printf 'common --repository_cache="%s/repository"\n' "$BAZEL_CACHE_DIR"
+          } >> "$HOME/.bazelrc"
+
+      - name: Host unit tests
+        if: steps.workspace.outputs.present == 'true'
+        run: bazel test --config=linux_arm64 --test_output=errors //apps/... //libs/...
+
+      # Firmware images need ESP-IDF; without it, analyze every target's graph
+      # (task policies, components, rule wiring) as GizOS's CI graph does.
+      - name: Firmware graph analysis
+        if: steps.workspace.outputs.present == 'true'
+        run: bazel build --nobuild --config=linux_arm64 --define=h2_ci_graph=true //targets/...
+
+  finish:
+    needs: [start, build]
+    if: always() && needs.start.outputs.run == 'true'
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: write
+    uses: gizlet/.github/.github/workflows/pr-check-finish.yml@latest
+    with:
+      check_run_id: ${{ needs.start.outputs.check_run_id }}
+      comment_id: ${{ needs.start.outputs.comment_id }}
+      result: ${{ needs.build.result }}
