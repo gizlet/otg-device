@@ -1,0 +1,24 @@
+load("@gizos//tools/bazel/platforms:compatibility.bzl", "HOST_TOOL_COMPATIBILITY")
+load("@gizos//tools/bazel/toolchains:cc_options.bzl", "H2_C11_OPTS", "H2_WARNING_COPTS")
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "hci",
+    srcs = ["src/otg_hci_acl.c"],
+    hdrs = ["include/otg_hci.h"],
+    conlyopts = H2_C11_OPTS,
+    copts = H2_WARNING_COPTS,
+    includes = ["include"],
+    deps = ["@gizos//pal"],
+)
+
+cc_test(
+    name = "acl_test",
+    srcs = ["tests/otg_hci_acl_test.c"],
+    conlyopts = H2_C11_OPTS,
+    copts = H2_WARNING_COPTS,
+    target_compatible_with = HOST_TOOL_COMPATIBILITY,
+    deps = [":hci"],
+)

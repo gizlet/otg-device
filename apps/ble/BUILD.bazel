@@ -1,0 +1,36 @@
+load("@gizos//tools/bazel/firmware:tasks.bzl", "h2_tasks")
+load("@gizos//tools/bazel/platforms:compatibility.bzl", "HOST_TOOL_COMPATIBILITY")
+load("@gizos//tools/bazel/toolchains:cc_options.bzl", "H2_C11_OPTS", "H2_WARNING_COPTS")
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# The firmware target starts otg_ble_run() on this task.
+h2_tasks(
+    name = "tasks",
+    tasks = ["ble/hci"],
+)
+
+cc_library(
+    name = "ble",
+    srcs = ["src/otg_ble.c"],
+    hdrs = ["include/otg_ble.h"],
+    conlyopts = H2_C11_OPTS,
+    copts = H2_WARNING_COPTS,
+    includes = ["include"],
+    deps = [
+        ":tasks",
+        "//libs/bt/hci",
+        "@gizos//libs/runtime",
+        "@gizos//pal",
+    ],
+)
+
+cc_test(
+    name = "ble_test",
+    srcs = ["tests/otg_ble_test.c"],
+    conlyopts = H2_C11_OPTS,
+    copts = H2_WARNING_COPTS,
+    target_compatible_with = HOST_TOOL_COMPATIBILITY,
+    deps = [":ble"],
+)

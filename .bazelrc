@@ -1,0 +1,39 @@
+common --enable_bzlmod
+common --noenable_workspace
+common --enable_platform_specific_config
+
+# GizClaw modules are served from the GizClaw registry; BCR stays first.
+common --registry=https://bcr.bazel.build
+common --registry=https://static-volc.gizclaw.com/bazel/
+
+build --strip=never
+
+build:linux --define=h2_host_os=linux
+build:linux --@rules_python//python/config_settings:bootstrap_impl=script
+build:linux --dynamic_mode=off
+build:macos --define=h2_host_os=macos
+
+# Host unit tests.
+build:macos_arm64 --platforms=@gizos//tools/bazel/platforms:macos_arm64
+build:macos_arm64 --define=h2_desktop_target=macos
+build:macos_arm64 --extra_toolchains=@gizos//tools/bazel/platforms:macos_arm64_test_toolchain
+build:macos_arm64 --action_env=MACOSX_DEPLOYMENT_TARGET=13.0
+build:macos_arm64 --macos_minimum_os=13.0
+build:linux_x86_64 --platforms=@gizos//tools/bazel/platforms:linux_x86_64
+build:linux_x86_64 --extra_toolchains=@gizos//tools/bazel/platforms:linux_x86_64_test_toolchain
+build:linux_arm64 --platforms=@gizos//tools/bazel/platforms:linux_arm64
+build:linux_arm64 --extra_toolchains=@gizos//tools/bazel/platforms:linux_arm64_test_toolchain
+
+# ESP-IDF firmware. Requires IDF_PATH and IDF_TOOLS_PATH for the pinned SDK.
+build:esp --repo_env=IDF_PATH
+build:esp --repo_env=IDF_TOOLS_PATH
+build:esp --repo_env=IDF_PYTHON_ENV_PATH
+build:esp --repo_env=H2_NATIVE_CCACHE_RUNTIME_ROOT
+build:esp32s3 --config=esp
+build:esp32s3 --define=h2_firmware_target=esp32s3
+build:esp32s3 --platforms=@gizos//tools/bazel/platforms:esp32s3
+
+test --build_tests_only
+test --test_output=errors
+
+try-import %workspace%/user.bazelrc
