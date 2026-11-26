@@ -56,7 +56,7 @@ jobs:
     # organization variable maps to linux-arm64, falling back to GitHub's ARM64
     # runner.
     runs-on: ${{ fromJSON(vars.RUNNERS || '{}')['linux-arm64'] || 'ubuntu-24.04-arm' }}
-    timeout-minutes: 60
+    timeout-minutes: 120
     # The job runs pull-request code: read-only token and no secrets.
     permissions:
       contents: read
